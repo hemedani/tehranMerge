@@ -260,7 +260,7 @@ function formatAccident(a: any): Accident {
     position: { id: parseId(a.position_id), name: a.position_name || "" },
     province: { id: parseId(a.province_id), name: a.province_name || "" },
     serialNO: parseNumeric(a.serialNO),
-    township: { id: parseId(a.township_id), name: a.township_name || "" },
+    township: { id: parseId(a.township_id), name: a.township_name || "تهران" },
     deadCount: parseNumeric(a.deadCount),
     xPosition: parseNumeric(a.xPosition),
     yPosition: parseNumeric(a.yPosition),
