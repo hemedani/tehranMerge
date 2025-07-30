@@ -19,6 +19,7 @@ import {
   CsvParseStream,
   parse,
 } from "https://deno.land/std@0.224.0/csv/mod.ts";
+import moment from "npm:moment-jalaali@0.10.0";
 
 // --- TYPE DEFINITIONS ---
 interface IdNamePair {
@@ -79,7 +80,7 @@ async function readCsvFile(filePath: string): Promise<any[]> {
     });
     return records;
   } catch (error) {
-    console.error(`Error processing CSV file "${filePath}":`, error.message);
+    console.error(`Error processing CSV file "${filePath}":`, (error as Error).message);
     Deno.exit(1);
   }
 }
@@ -116,127 +117,303 @@ async function getCsvHeaders(filePath: string): Promise<string[]> {
   return headers;
 }
 
+// --- DATE CONVERSION HELPER ---
+/**
+ * Converts Jalali (Persian/Shamsi) date to Gregorian date
+ * @param jalaliDate The Jalali date string (can be in various formats)
+ * @returns Gregorian date string in ISO format, or original string if conversion fails
+ */
+function convertJalaliToGregorian(jalaliDate: string): string {
+  if (!jalaliDate || jalaliDate.trim() === "") return "";
+
+  try {
+    // Remove any extra whitespace
+    let cleanDate = jalaliDate.trim();
+
+    // Check if it's already a Gregorian date (contains year >= 1900)
+    const gregorianPattern = /\b(19|20)\d{2}\b/;
+    if (gregorianPattern.test(cleanDate)) {
+      return cleanDate;
+    }
+
+    // Check if it's a valid Jalali date pattern (year between 1300-1500)
+    const jalaliPattern = /\b(13|14|15)\d{2}\b/;
+    if (!jalaliPattern.test(cleanDate)) {
+      return cleanDate; // Return as-is if doesn't look like Jalali date
+    }
+
+    // Extract date and time parts
+    // Handle formats like "04/11/1398 5: 45: 00.000000 PM"
+    let timeString = "";
+    let dateOnly = cleanDate;
+
+    const dateTimeMatch = cleanDate.match(/^(\d{1,2}\/\d{1,2}\/\d{4})\s+(.+)$/);
+    if (dateTimeMatch) {
+      dateOnly = dateTimeMatch[1];
+      timeString = dateTimeMatch[2].trim();
+    }
+
+    // Try different Jalali date formats
+    const formats = [
+      'jMM/jDD/jYYYY',  // MM/DD/YYYY format (common in the data)
+      'jDD/jMM/jYYYY',  // DD/MM/YYYY format
+      'jYYYY/jMM/jDD',  // YYYY/MM/DD format
+      'jYYYY-jMM-jDD',  // YYYY-MM-DD format
+      'jYYYY/jM/jD',    // YYYY/M/D format
+      'jYYYY-jM-jD',    // YYYY-M-D format
+      'jM/jD/jYYYY',    // M/D/YYYY format
+      'jD/jM/jYYYY'     // D/M/YYYY format
+    ];
+
+    for (const format of formats) {
+      const momentDate = moment(dateOnly, format);
+      if (momentDate.isValid()) {
+        // Validate the converted date is reasonable (after 1900, before 2100)
+        const year = momentDate.year();
+        if (year >= 1900 && year <= 2100) {
+          // Convert to JavaScript Date
+          let jsDate = momentDate.toDate();
+
+          // If we have time information, try to parse and apply it
+          if (timeString) {
+            try {
+              // Parse time from formats like "5: 45: 00.000000 PM" or "12:30:45 AM"
+              const timeMatch = timeString.match(/(\d{1,2}):?\s*(\d{1,2}):?\s*(\d{1,2})(?:\.\d+)?\s*(AM|PM)?/i);
+              if (timeMatch) {
+                let hours = parseInt(timeMatch[1]);
+                const minutes = parseInt(timeMatch[2]) || 0;
+                const seconds = parseInt(timeMatch[3]) || 0;
+                const ampm = timeMatch[4]?.toUpperCase();
+
+                if (ampm === 'PM' && hours !== 12) hours += 12;
+                if (ampm === 'AM' && hours === 12) hours = 0;
+
+                jsDate.setHours(hours, minutes, seconds, 0);
+              }
+            } catch (e) {
+              // If time parsing fails, just use the date part
+            }
+          }
+
+          // Format as JavaScript toLocaleString format: "Aug 27, 2024, 8:30:00 PM"
+          const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                         'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+          const month = months[jsDate.getMonth()];
+          const day = jsDate.getDate();
+          const year = jsDate.getFullYear();
+
+          let hours = jsDate.getHours();
+          const minutes = jsDate.getMinutes().toString().padStart(2, '0');
+          const seconds = jsDate.getSeconds().toString().padStart(2, '0');
+
+          const ampm = hours >= 12 ? 'PM' : 'AM';
+          hours = hours % 12;
+          if (hours === 0) hours = 12;
+
+          return `${month} ${day}, ${year}, ${hours}:${minutes}:${seconds} ${ampm}`;
+        }
+      }
+    }
+
+    // If no format worked, return original
+    return cleanDate;
+  } catch (error) {
+    console.warn(`Failed to convert Jalali date "${jalaliDate}":`, (error as Error).message);
+    return jalaliDate;
+  }
+}
+
 // --- DATA FORMATTING FUNCTIONS ---
 // These functions transform flat data rows into the required nested JSON structure.
 
 function formatAccident(a: any): Accident {
+  // Helper function to parse numeric value or return 0
+  const parseNumeric = (val: any) => {
+    if (val === "" || val === null || val === undefined) return 0;
+    const parsed = parseFloat(val);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
+  // Helper function to parse ID value
+  const parseId = (val: any) => {
+    if (val === "" || val === null || val === undefined) return 0;
+    const parsed = parseInt(val);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
+  // Helper function to parse string arrays
+  const parseStringArray = (val: any, itemName: string) => {
+    if (!val || val === "") return [];
+    const items = val.split(",").map((item: string) => item.trim()).filter((item: string) => item !== "");
+    return items.map((item: string, index: number) => ({
+      id: index + 1,
+      name: item
+    }));
+  };
+
   return {
-    road: { id: a.road_id || "", name: a.road_name || "" },
-    seri: a.seri,
-    type: { id: a.type_id || "", name: a.type_name || "" },
-    officer: a.officer,
-    position: { id: a.position_id || "", name: a.position_name || "" },
-    province: { id: a.province_id || "", name: a.province_name || "" },
-    serialNO: a.serialNO,
-    township: { id: a.township_id || "", name: a.township_name || "" },
-    deadCount: a.deadCount,
-    xPosition: a.xPosition,
-    yPosition: a.yPosition,
-    areaUsages: a.areaUsages,
-    hasWitness: a.hasWitness,
-    newsNumber: a.newsNumber,
-    rulingType: { id: a.rulingType_id || "", name: a.rulingType_name || "" },
-    airStatuses: a.airStatuses,
-    attachments: a.attachments,
-    lightStatus: { id: a.lightStatus_id || "", name: a.lightStatus_name || "" },
-    roadDefects: a.roadDefects,
-    accidentDate: a.accidentDate,
-    base64Images: a.base64Images,
-    humanReasons: a.AMEL_humanReasons,
-    injuredCount: a.injuredCount,
+    road: { id: parseId(a.road_id), name: a.road_name || "" },
+    seri: a.seri || "",
+    type: { id: parseId(a.type_id), name: a.type_name || "" },
+    officer: a.officer || "",
+    position: { id: parseId(a.position_id), name: a.position_name || "" },
+    province: { id: parseId(a.province_id), name: a.province_name || "" },
+    serialNO: parseNumeric(a.serialNO),
+    township: { id: parseId(a.township_id), name: a.township_name || "" },
+    deadCount: parseNumeric(a.deadCount),
+    xPosition: parseNumeric(a.xPosition),
+    yPosition: parseNumeric(a.yPosition),
+    areaUsages: parseStringArray(a.areaUsages, "area"),
+    hasWitness: a.hasWitness === "true" || a.hasWitness === true,
+    newsNumber: a.newsNumber || "",
+    rulingType: { id: parseId(a.rulingType_id), name: a.rulingType_name || "" },
+    airStatuses: parseStringArray(a.airStatuses, "air"),
+    attachments: a.attachments ? (Array.isArray(a.attachments) ? a.attachments : []) : [],
+    lightStatus: { id: parseId(a.lightStatus_id), name: a.lightStatus_name || "" },
+    roadDefects: parseStringArray(a.roadDefects, "defect"),
+    base64Images: a.base64Images ? (Array.isArray(a.base64Images) ? a.base64Images : []) : [],
+    humanReasons: parseStringArray(a.AMEL_humanReasons, "reason"),
+    injuredCount: parseNumeric(a.injuredCount),
     collisionType: {
-      id: a.collisionType_id || "",
+      id: parseId(a.collisionType_id),
       name: a.collisionType_name || "",
     },
     roadSituation: {
-      id: a.roadSituation_id || "",
+      id: parseId(a.roadSituation_id),
       name: a.roadSituation_name || "",
     },
-    completionDate: a.completionDate,
     roadRepairType: {
-      id: a.roadRepairType_id || "",
+      id: parseId(a.roadRepairType_id),
       name: a.roadRepairType_name || "",
     },
     shoulderStatus: {
-      id: a.shoulderStatus_id || "",
+      id: parseId(a.shoulderStatus_id),
       name: a.shoulderStatus_name || "",
     },
-    vehicleReasons: a.vehicleReasons,
-    equipmentDamages: a.equipmentDamages,
-    roadSurfaceConditions: a.roadSurfaceConditions,
+    vehicleReasons: parseStringArray(a.vehicleReasons, "vehicle"),
+    equipmentDamages: parseStringArray(a.equipmentDamages, "damage"),
+    roadSurfaceConditions: parseStringArray(a.roadSurfaceConditions, "surface"),
+    accidentDate: convertJalaliToGregorian(a.accidentDate || ""),
+    completionDate: convertJalaliToGregorian(a.completionDate || ""),
     accident_id: a.accident_id,
   };
 }
 
 function formatVehicle(v: any): Vehicle {
+  // Helper function to parse numeric value or return 0
+  const parseNumeric = (val: any) => {
+    if (val === "" || val === null || val === undefined) return 0;
+    const parsed = parseFloat(val);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
+  // Helper function to parse ID value
+  const parseId = (val: any) => {
+    if (val === "" || val === null || val === undefined) return 0;
+    const parsed = parseInt(val);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
+  // Helper function to parse plaque numbers
+  const parsePlaqueNo = (val: any) => {
+    if (!val || val === "") return [];
+    if (Array.isArray(val)) return val;
+    return val.toString().split(/[\s,]+/).filter((item: string) => item.trim() !== "");
+  };
+
+  // Helper function to parse damage sections
+  const parseDamageSections = (val: any) => {
+    if (!val || val === "") return [];
+    const sections = val.split(",").map((item: string) => item.trim()).filter((item: string) => item !== "");
+    return sections.map((section: string, index: number) => ({
+      id: index + 1,
+      name: section
+    }));
+  };
+
   return {
-    color: { id: v.color_id || "", name: v.color_name || "" },
+    color: { id: parseId(v.color_id), name: v.color_name || "" },
     driver: {
-      sex: { id: v.driver_sex_id || "", name: v.driver_sex_name || "" },
-      lastName: v.driver_lastName,
-      firstName: v.driver_firstName,
+      sex: { id: parseId(v.driver_sex_id), name: v.driver_sex_name || "" },
+      lastName: v.driver_lastName || "",
+      firstName: v.driver_firstName || "",
       injuryType: {
-        id: v.driver_injuryType_id || "",
+        id: parseId(v.driver_injuryType_id),
         name: v.driver_injuryType_name || "",
       },
-      licenceType: { name: v.driver_licenceType_name || "" },
+      licenceType: { id: parseId(v.driver_licenceType_id), name: v.driver_licenceType_name || "" },
       totalReason: {
-        id: v.driver_totalReason_id || "",
+        id: parseId(v.driver_totalReason_id),
         name: v.driver_totalReason_name || "",
       },
-      nationalCode: v.driver_nationalCode,
-      licenceNumber: v.driver_licenceNumber,
+      nationalCode: v.driver_nationalCode || "",
+      licenceNumber: v.driver_licenceNumber || "",
     },
-    system: { id: v.system_id || "", name: v.system_name || "" },
-    plaqueNo: v.plaqueNo,
-    plaqueType: { id: v.plaqueType_id || "", name: v.plaqueType_name || "" },
-    systemType: { id: v.systemType_id || "", name: v.systemType_name || "" },
-    faultStatus: { id: v.faultStatus_id || "", name: v.faultStatus_name || "" },
-    insuranceCo: { id: v.insuranceCo_id || "", name: v.insuranceCo_name || "" },
-    insuranceNo: v.insuranceNo,
-    plaqueUsage: { id: v.plaqueUsage_id || "", name: v.plaqueUsage_name || "" },
-    printNumber: v.printNumber,
-    plaqueSerial: v.plaqueSerial,
-    insuranceDate: v.insuranceDate,
+    system: { id: parseId(v.system_id), name: v.system_name || "" },
+    plaqueNo: parsePlaqueNo(v.plaqueNo),
+    plaqueType: { id: parseId(v.plaqueType_id), name: v.plaqueType_name || "" },
+    systemType: { id: parseId(v.systemType_id), name: v.systemType_name || "" },
+    faultStatus: { id: parseId(v.faultStatus_id), name: v.faultStatus_name || "" },
+    insuranceCo: { id: parseId(v.insuranceCo_id), name: v.insuranceCo_name || "" },
+    insuranceNo: v.insuranceNo || "",
+    plaqueUsage: { id: parseId(v.plaqueUsage_id), name: v.plaqueUsage_name || "" },
+    printNumber: v.printNumber || "",
+    plaqueSerial: parsePlaqueNo(v.plaqueSerial),
+    insuranceDate: convertJalaliToGregorian(v.insuranceDate || ""),
     bodyInsuranceCo: {
-      id: v.bodyInsuranceCo_id || "",
+      id: parseId(v.bodyInsuranceCo_id),
       name: v.bodyInsuranceCo_name || "",
     },
-    bodyInsuranceNo: v.bodyInsuranceNo,
+    bodyInsuranceNo: v.bodyInsuranceNo || "",
     motionDirection: {
-      id: v.motionDirection_id || "",
+      id: parseId(v.motionDirection_id),
       name: v.motionDirection_name || "",
     },
-    bodyInsuranceDate: v.bodyInsuranceDate,
-    maxDamageSections: v.maxDamageSections,
-    damageSectionOther: v.damageSectionOther,
-    insuranceWarrantyLimit: v.insuranceWarrantyLimit,
+    bodyInsuranceDate: convertJalaliToGregorian(v.bodyInsuranceDate || ""),
+    maxDamageSections: parseDamageSections(v.maxDamageSections),
+    damageSectionOther: v.damageSectionOther || "",
+    insuranceWarrantyLimit: parseNumeric(v.insuranceWarrantyLimit),
     accident_id: v.accident_id,
     vehicle_id: v.vehicle_id,
   };
 }
 
 function formatPassenger(p: any): Passenger {
+  // Helper function to parse ID value
+  const parseId = (val: any) => {
+    if (val === "" || val === null || val === undefined) return 0;
+    const parsed = parseInt(val);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
   return {
-    sex: { id: p.sex_id || "", name: p.sex_name || "" },
-    lastName: p.lastName,
-    firstName: p.firstName,
-    injuryType: { id: p.injuryType_id || "", name: p.injuryType_name || "" },
-    faultStatus: { id: p.faultStatus_id || "", name: p.faultStatus_name || "" },
-    totalReason: { id: p.totalReason_id || "", name: p.totalReason_name || "" },
-    nationalCode: p.nationalCode,
+    sex: { id: parseId(p.sex_id), name: p.sex_name || "" },
+    lastName: p.lastName || "",
+    firstName: p.firstName || "",
+    injuryType: { id: parseId(p.injuryType_id), name: p.injuryType_name || "" },
+    faultStatus: { id: parseId(p.faultStatus_id), name: p.faultStatus_name || "" },
+    totalReason: { id: parseId(p.totalReason_id), name: p.totalReason_name || "" },
+    nationalCode: p.nationalCode || "",
   };
 }
 
 function formatPedestrian(p: any): Pedestrian {
+  // Helper function to parse ID value
+  const parseId = (val: any) => {
+    if (val === "" || val === null || val === undefined) return 0;
+    const parsed = parseInt(val);
+    return isNaN(parsed) ? 0 : parsed;
+  };
+
   return {
-    sex: { id: p.sex_id || "", name: p.sex_name || "" },
-    lastName: p.lastName,
-    firstName: p.firstName,
-    injuryType: { id: p.injuryType_id || "", name: p.injuryType_name || "" },
-    faultStatus: { id: p.faultStatus_id || "", name: p.faultStatus_name || "" },
-    totalReason: { id: p.totalReason_id || "", name: p.totalReason_name || "" },
-    nationalCode: p.nationalCode,
+    sex: { id: parseId(p.sex_id), name: p.sex_name || "" },
+    lastName: p.lastName || "",
+    firstName: p.firstName || "",
+    injuryType: { id: parseId(p.injuryType_id), name: p.injuryType_name || "" },
+    faultStatus: { id: parseId(p.faultStatus_id), name: p.faultStatus_name || "" },
+    totalReason: { id: parseId(p.totalReason_id), name: p.totalReason_name || "" },
+    nationalCode: p.nationalCode || "",
   };
 }
 
@@ -354,7 +531,7 @@ async function main() {
       delete accident.accident_id;
 
       const finalObject = { accident_json: JSON.stringify(accident) };
-      const jsonString = JSON.stringify(finalObject, null, 2);
+      const jsonString = JSON.stringify(finalObject, null, 4);
       await outputFile.write(encoder.encode(jsonString));
 
       isFirst = false;
@@ -363,7 +540,7 @@ async function main() {
     await outputFile.write(encoder.encode("\n]\n"));
     console.log("\n✅ Successfully created 'merged.json'!");
   } catch (error) {
-    console.error("Error during file write operation:", error.message);
+    console.error("Error during file write operation:", (error as Error).message);
   } finally {
     // Ensure the output file is always closed.
     outputFile.close();
